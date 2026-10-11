@@ -2,9 +2,11 @@
 # Builds Shhh.app into ./build.
 #   ./scripts/build.sh            build only
 #   ./scripts/build.sh --install  build, copy to /Applications and (re)launch
+#   ./scripts/build.sh --release  build signed ad-hoc and zip it to build/Shhh.zip (for GitHub releases)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+MODE="${1:-}"
 APP="build/Shhh.app"
 SIGN_ID="Shhh Local Signing"
 
@@ -22,23 +24,30 @@ for bundle in "$BIN"/*.bundle; do
 done
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/Shhh" 2>/dev/null || true
 
-# Sign with the local certificate if it exists (keeps macOS permissions across rebuilds),
-# otherwise ad-hoc. Run ./scripts/make-signing-cert.sh once to create it.
-# SHHH_ADHOC=1 forces ad-hoc signing (used for release downloads).
-if [ -z "${SHHH_ADHOC:-}" ] && security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
+# Local builds are signed with the local certificate if it exists, so macOS keeps the
+# Accessibility and Microphone permissions across rebuilds (create it once with
+# ./scripts/make-signing-cert.sh). Release downloads are signed ad-hoc.
+if [ "$MODE" != "--release" ] && security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
   IDENTITY="$SIGN_ID"
 else
   IDENTITY="-"
-  echo "Note: signing ad-hoc. Run ./scripts/make-signing-cert.sh so permissions survive rebuilds."
+  [ "$MODE" != "--release" ] && echo "Note: signing ad-hoc. Run ./scripts/make-signing-cert.sh so permissions survive rebuilds."
 fi
 codesign --force --sign "$IDENTITY" "$APP/Contents/Frameworks/llama.framework"
 codesign --force --sign "$IDENTITY" "$APP"
 echo "Built $APP"
 
-if [ "${1:-}" = "--install" ]; then
-  pkill -x Shhh 2>/dev/null && sleep 1 || true
-  rm -rf /Applications/Shhh.app
-  cp -R "$APP" /Applications/Shhh.app
-  open /Applications/Shhh.app
-  echo "Installed to /Applications and launched."
-fi
+case "$MODE" in
+  --install)
+    pkill -x Shhh 2>/dev/null && sleep 1 || true
+    rm -rf /Applications/Shhh.app
+    cp -R "$APP" /Applications/Shhh.app
+    open /Applications/Shhh.app
+    echo "Installed to /Applications and launched."
+    ;;
+  --release)
+    rm -f build/Shhh.zip
+    ditto -c -k --keepParent "$APP" build/Shhh.zip
+    echo "Zipped to build/Shhh.zip"
+    ;;
+esac

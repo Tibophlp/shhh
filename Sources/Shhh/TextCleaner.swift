@@ -62,9 +62,20 @@ actor TextCleaner {
 
     static var isDownloaded: Bool { FileManager.default.fileExists(atPath: modelPath.path) }
 
+    private var loading: Task<Void, Error>?
+
     /// Downloads the model on first use (~1.1 GB) and loads it into memory.
+    /// Calls made while a load is already running wait for that load instead of starting another.
     func load(progress: @escaping @Sendable (Double) -> Void) async throws {
         guard context == nil else { return }
+        if let loading { return try await loading.value }
+        let task = Task { try await performLoad(progress: progress) }
+        loading = task
+        defer { loading = nil }
+        try await task.value
+    }
+
+    private func performLoad(progress: @escaping @Sendable (Double) -> Void) async throws {
         if !Self.isDownloaded { try await Self.download(progress: progress) }
 
         llama_log_set({ _, _, _ in }, nil)

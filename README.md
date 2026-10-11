@@ -30,9 +30,11 @@ I built Shhh to talk to AI tools instead of typing long prompts. It does one thi
 - **Invisible until needed.** A small pill shows at the bottom of the screen only while you're holding the key.
 - **Fast.** Speech is transcribed in a fraction of a second on the Apple Neural Engine.
 - **English and French** (and 23 other European languages), detected automatically. No setting to switch.
+- **Your writing style.** Very formal, casual or very casual, applied instantly.
+- **Picks the right microphone.** AirPods when they're in, your Mac otherwise. With the lid closed on an external monitor, it switches to your iPhone's microphone.
+- **Optional AI cleanup.** Removes "um", repeated words and spoken self-corrections, also on-device.
 - **Private.** Audio never leaves your Mac. Nothing is stored.
 - **Doesn't get in the way.** ⌘C, ⌘Tab and every other shortcut still work. Your clipboard is restored after each paste.
-- **Optional AI cleanup.** Removes "um", repeated words and spoken self-corrections, also on-device.
 
 ## Install
 
@@ -75,12 +77,34 @@ The speech model (~600 MB) downloads once on first launch. A waveform icon then 
 | Tap right ⌘ quickly | Nothing. Only a real hold records. |
 | Press another key while holding | Recording is cancelled, and your shortcut works as usual. |
 
-The menu-bar icon has four options:
+The menu-bar icon has these options:
 
+- **Writing style**: very formal, casual or very casual (see below).
+- **Microphone**: Automatic, or a specific microphone.
 - **AI cleanup**: turn the cleanup pass on or off.
 - **Copy last transcript**: get your text back if the cursor wasn't in a text field.
 - **Launch at login**
 - **Quit**
+
+## Writing style
+
+| Style | Example |
+| --- | --- |
+| **Very formal** | I do not think it is ready, we are going to need more tests. |
+| **Casual** (default) | I don't think it's ready, we're gonna need more tests. |
+| **Very casual** | i don't think it's ready, we're gonna need more tests |
+
+Very formal expands contractions and slang ("gonna" becomes "going to") and always ends with punctuation. Very casual is all lowercase (acronyms like API stay) with no final period. Casual leaves your words as spoken.
+
+## Microphone
+
+**Automatic** (the default) chooses for you, in this order:
+
+1. Headphones or an external mic: AirPods, a USB mic, a wired headset, a webcam or monitor mic.
+2. Your Mac's built-in microphone.
+3. **Lid closed?** The built-in mic is switched off when a MacBook is closed, so Shhh uses your iPhone's microphone instead (Continuity: same Apple ID, iPhone nearby).
+
+You can also pick a specific microphone from the menu. Shhh remembers it and uses it whenever it's connected, and falls back to Automatic when it isn't. With the lid closed, the built-in one is greyed out. Virtual microphones (Teams, Zoom, loopback drivers) are hidden.
 
 ## AI cleanup
 
@@ -99,15 +123,16 @@ Off by default. Turn it on from the menu bar. It downloads a small local model (
 ## How it works
 
 ```
-right ⌘ held ─▶ microphone (16 kHz) ─▶ Parakeet speech model ─▶ [AI cleanup] ─▶ paste at cursor
+right ⌘ held ─▶ microphone ─▶ Parakeet speech model ─▶ [AI cleanup] ─▶ writing style ─▶ paste at cursor
 ```
 
 | | |
 | --- | --- |
 | Speech to text | [NVIDIA Parakeet](https://huggingface.co/FluidInference/parakeet-ultra-coreml) on the Neural Engine, via [FluidAudio](https://github.com/FluidInference/FluidAudio) |
 | Cleanup | [Qwen3 1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) via [llama.cpp](https://github.com/ggml-org/llama.cpp), prompted as a copy-editor, with a delete-only safety check |
+| Microphone | Core Audio device list, lid state read from IOKit (`AppleClamshellState`) |
 | Typing | Clipboard + ⌘V into the focused app, then your previous clipboard is restored |
-| App | Native Swift, under 900 lines, no dependencies beyond the two above |
+| App | Native Swift, about 1,400 lines, no dependencies beyond the two above |
 
 <details>
 <summary><b>Project layout</b></summary>
@@ -117,12 +142,15 @@ Sources/Shhh/
   AppDelegate.swift      menu bar, permissions, dictation flow
   HotkeyMonitor.swift    right ⌘ detection
   AudioRecorder.swift    microphone capture
+  AudioDevices.swift     microphone list, Automatic choice, lid detection
+  WritingStyle.swift     very formal / casual / very casual
   Transcriber.swift      speech to text
   TextCleaner.swift      optional AI cleanup
   TextInserter.swift     paste + clipboard restore
   RecordingPanel.swift   the pill
+  CommandLineTool.swift  terminal test modes (below)
 scripts/
-  build.sh               build Shhh.app (--install to install and launch)
+  build.sh               build Shhh.app (--install: install and launch, --release: zip for GitHub)
   make-signing-cert.sh   local signing certificate
   make-icon.swift        regenerate the app icon
 ```
@@ -133,6 +161,9 @@ Test the pipeline without the app:
 BIN=$(swift build -c release --show-bin-path)
 $BIN/Shhh --transcribe recording.wav
 $BIN/Shhh --clean "Um, let's meet Monday, actually no, Tuesday."
+$BIN/Shhh --style veryFormal "I don't think it's ready."
+$BIN/Shhh --microphones            # what Automatic would pick right now
+$BIN/Shhh --record 3               # record 3 s from it and transcribe
 ```
 
 </details>
@@ -146,6 +177,12 @@ Make sure Shhh is enabled in **System Settings → Privacy & Security → Access
 </details>
 
 <details>
+<summary><b>Shhh beeps when I hold right ⌘</b></summary>
+
+Something is missing, and the menu-bar menu says what: the speech model is still downloading, Microphone access isn't granted, or no microphone is available (for example the lid is closed with no iPhone or headphones around).
+</details>
+
+<details>
 <summary><b>The text didn't appear</b></summary>
 
 The cursor needs to be in a text field when you let go. Use **Copy last transcript** from the menu bar to get the text back.
@@ -155,6 +192,12 @@ The cursor needs to be in a text field when you let go. Use **Copy last transcri
 <summary><b>The first word is sometimes cut off</b></summary>
 
 The microphone takes a split second to start. Wait a beat after pressing right ⌘ before you speak, especially with Bluetooth headphones.
+</details>
+
+<details>
+<summary><b>The iPhone microphone takes a moment</b></summary>
+
+The iPhone's microphone starts about 3 seconds after you press right ⌘, but it buffers everything, so nothing you say is lost. Shhh just waits for it to catch up after you let go. Keep the iPhone close: it hears whatever is around it.
 </details>
 
 <details>
