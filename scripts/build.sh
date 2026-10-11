@@ -24,7 +24,8 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/Mac
 
 # Sign with the local certificate if it exists (keeps macOS permissions across rebuilds),
 # otherwise ad-hoc. Run ./scripts/make-signing-cert.sh once to create it.
-if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
+# SHHH_ADHOC=1 forces ad-hoc signing (used for release downloads).
+if [ -z "${SHHH_ADHOC:-}" ] && security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
   IDENTITY="$SIGN_ID"
 else
   IDENTITY="-"
