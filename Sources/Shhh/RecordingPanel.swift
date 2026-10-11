@@ -1,0 +1,108 @@
+import AppKit
+import SwiftUI
+
+/// The small pill at the bottom of the screen. Only visible while recording or transcribing.
+final class RecordingPanel {
+    private let model = PillModel()
+    private lazy var panel: NSPanel = makePanel()
+
+    func showRecording() {
+        model.mode = .recording
+        model.levels = Array(repeating: 0, count: PillModel.barCount)
+        position()
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.12; panel.animator().alphaValue = 1 }
+    }
+
+    func showProcessing() {
+        model.mode = .processing
+    }
+
+    func hide() {
+        guard panel.isVisible else { return }
+        NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; panel.animator().alphaValue = 0 }) {
+            self.panel.orderOut(nil)
+        }
+    }
+
+    /// Feed microphone loudness (0...1). Safe to call from any thread.
+    func push(level: Float) {
+        DispatchQueue.main.async { [model] in
+            guard model.mode == .recording else { return }
+            model.levels.removeFirst()
+            model.levels.append(CGFloat(level))
+        }
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 96, height: 30),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.level = .statusBar
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.contentView = NSHostingView(rootView: PillView(model: model))
+        return panel
+    }
+
+    /// Bottom-centre of the screen the mouse is on.
+    private func position() {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        guard let frame = screen?.visibleFrame else { return }
+        let size = panel.frame.size
+        panel.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2, y: frame.minY + 18))
+    }
+}
+
+final class PillModel: ObservableObject {
+    enum Mode { case recording, processing }
+    static let barCount = 11
+    @Published var mode: Mode = .recording
+    @Published var levels: [CGFloat] = Array(repeating: 0, count: barCount)
+}
+
+private struct PillView: View {
+    @ObservedObject var model: PillModel
+
+    var body: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.black.opacity(0.85))
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5))
+            if model.mode == .recording {
+                HStack(spacing: 3) {
+                    ForEach(0..<model.levels.count, id: \.self) { i in
+                        Capsule()
+                            .fill(Color.white)
+                            .frame(width: 3, height: 4 + model.levels[i] * 14)
+                    }
+                }
+                .animation(.easeOut(duration: 0.08), value: model.levels)
+            } else {
+                ProcessingDots()
+            }
+        }
+        .frame(width: 96, height: 30)
+    }
+}
+
+private struct ProcessingDots: View {
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 5) {
+                ForEach(0..<3, id: \.self) { i in
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 5, height: 5)
+                        .opacity(0.35 + 0.65 * max(0, sin(t * 6 - Double(i) * 0.8)))
+                }
+            }
+        }
+    }
+}
