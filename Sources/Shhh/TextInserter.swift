@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 
 /// Types text into the focused app by pasting it, then puts the user's clipboard back.
+@MainActor
 enum TextInserter {
     static func insert(_ text: String) {
         let pasteboard = NSPasteboard.general
@@ -19,9 +20,11 @@ enum TextInserter {
         pressCommandV()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-            // Only restore if nothing new was copied in the meantime.
-            guard pasteboard.changeCount == changeCount else { return }
-            restore(saved, to: pasteboard)
+            MainActor.assumeIsolated {
+                // Only restore if nothing new was copied in the meantime.
+                guard pasteboard.changeCount == changeCount else { return }
+                restore(saved, to: pasteboard)
+            }
         }
     }
 

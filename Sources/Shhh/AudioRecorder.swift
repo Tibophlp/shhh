@@ -1,6 +1,7 @@
+import AudioToolbox
 import AVFoundation
 
-/// Records the default microphone as 16 kHz mono Float32, the format the speech model expects.
+/// Records a microphone as 16 kHz mono Float32, the format the speech model expects.
 final class AudioRecorder {
     /// Called on the audio thread with a 0...1 loudness value, for the waveform.
     var onLevel: ((Float) -> Void)?
@@ -11,24 +12,45 @@ final class AudioRecorder {
     private let lock = NSLock()
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
 
-    func start() throws {
+    /// Starts recording from `deviceID`, or from the system default microphone when nil.
+    func start(deviceID: AudioDeviceID? = nil) throws {
         lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        converter = nil
 
         // A fresh engine each time picks up microphone changes (AirPods connected, etc.).
         let engine = AVAudioEngine()
         let input = engine.inputNode
-        let inputFormat = input.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw RecorderError.noMicrophone
+        if var deviceID, let unit = input.audioUnit {
+            let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                              &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard status == noErr else { throw RecorderError.noMicrophone }
         }
-        self.converter = converter
-
-        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        // Tap in the microphone's own format (after switching devices the node's output format
+        // can be stale and the engine refuses to start). Converted to 16 kHz per buffer below.
+        let format = input.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { throw RecorderError.noMicrophone }
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.process(buffer)
         }
         engine.prepare()
         try engine.start()
         self.engine = engine
+    }
+
+    /// Seconds of audio received so far.
+    var capturedSeconds: Double {
+        lock.lock(); defer { lock.unlock() }
+        return Double(samples.count) / targetFormat.sampleRate
+    }
+
+    /// Some microphones deliver audio late: the iPhone's (Continuity) starts about 3 s behind but
+    /// then sends everything. Keep listening until the audio covers how long the key was held.
+    func stop(covering duration: TimeInterval, timeout: TimeInterval = 4) async -> [Float] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while capturedSeconds < duration - 0.25, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return await MainActor.run { stop() }
     }
 
     /// Stops recording and returns everything captured since `start()`.
@@ -38,7 +60,6 @@ final class AudioRecorder {
             engine.stop()
         }
         engine = nil
-        converter = nil
         lock.lock(); defer { lock.unlock() }
         return samples
     }
@@ -51,6 +72,9 @@ final class AudioRecorder {
             onLevel?(min(1, rms * 12))
         }
 
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+        }
         guard let converter else { return }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32

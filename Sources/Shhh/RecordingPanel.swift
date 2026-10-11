@@ -2,11 +2,15 @@ import AppKit
 import SwiftUI
 
 /// The small pill at the bottom of the screen. Only visible while recording or transcribing.
+@MainActor
 final class RecordingPanel {
     private let model = PillModel()
     private lazy var panel: NSPanel = makePanel()
+    /// Bumped on every show so a fade-out that finishes late can't hide a newer pill.
+    private var generation = 0
 
     func showRecording() {
+        generation += 1
         model.mode = .recording
         model.levels = Array(repeating: 0, count: PillModel.barCount)
         position()
@@ -21,18 +25,25 @@ final class RecordingPanel {
 
     func hide() {
         guard panel.isVisible else { return }
+        let hiding = generation
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; panel.animator().alphaValue = 0 }) {
-            self.panel.orderOut(nil)
+            MainActor.assumeIsolated {
+                if self.generation == hiding { self.panel.orderOut(nil) }
+            }
         }
     }
 
-    /// Feed microphone loudness (0...1). Safe to call from any thread.
-    func push(level: Float) {
-        DispatchQueue.main.async { [model] in
-            guard model.mode == .recording else { return }
-            model.levels.removeFirst()
-            model.levels.append(CGFloat(level))
+    /// Feed microphone loudness (0...1). Called from the audio thread.
+    nonisolated func push(level: Float) {
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.append(level: level) }
         }
+    }
+
+    private func append(level: Float) {
+        guard model.mode == .recording else { return }
+        model.levels.removeFirst()
+        model.levels.append(CGFloat(level))
     }
 
     private func makePanel() -> NSPanel {

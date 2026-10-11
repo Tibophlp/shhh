@@ -5,6 +5,7 @@ import AppKit
 /// Holding right ⌘ alone fires `onPress`, letting go fires `onRelease`.
 /// If another key is pressed while right ⌘ is held (a normal shortcut like ⌘C),
 /// `onCancel` fires instead and the release is ignored.
+@MainActor
 final class HotkeyMonitor {
     var onPress: () -> Void = {}
     var onRelease: () -> Void = {}
@@ -17,15 +18,19 @@ final class HotkeyMonitor {
     private var isDown = false
     private var cancelled = false
 
-    var isRunning: Bool { !monitors.isEmpty }
-
+    /// Needs the Accessibility permission to see keys pressed in other apps.
     func start() {
         guard monitors.isEmpty else { return }
         let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown]
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] in self?.handle($0) }) {
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.handle(event) }
+        }) {
             monitors.append(global)
         }
-        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] in self?.handle($0); return $0 }) {
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.handle(event) }
+            return event
+        }) {
             monitors.append(local)
         }
     }

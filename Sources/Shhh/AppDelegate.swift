@@ -2,6 +2,9 @@ import AppKit
 import AVFoundation
 import ServiceManagement
 
+/// Owns the menu-bar item and runs the dictation flow:
+/// hold right ⌘ → record → transcribe → (cleanup) → writing style → paste.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let hotkey = HotkeyMonitor()
     private let recorder = AudioRecorder()
@@ -15,32 +18,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var showPanelWork: DispatchWorkItem?
     private var lastTranscript: String?
 
+    private var speechReady = false
     private var speechStatus = "Loading speech model…"
     private var cleanupStatus: String?
 
     private enum State { case idle, recording, processing }
+
+    // MARK: - Settings
 
     private var aiCleanup: Bool {
         get { UserDefaults.standard.bool(forKey: "aiCleanup") }
         set { UserDefaults.standard.set(newValue, forKey: "aiCleanup") }
     }
 
-    // MARK: - Launch
+    private var writingStyle: WritingStyle {
+        get { WritingStyle(rawValue: UserDefaults.standard.string(forKey: "writingStyle") ?? "") ?? .casual }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "writingStyle") }
+    }
+
+    /// The microphone the user picked, or nil for Automatic.
+    private var microphoneUID: String? {
+        get { UserDefaults.standard.string(forKey: "microphoneUID") }
+        set { UserDefaults.standard.set(newValue, forKey: "microphoneUID") }
+    }
+
+    // MARK: - Launch and quit
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Shhh")
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
 
         hotkey.onPress = { [weak self] in self?.startRecording() }
         hotkey.onRelease = { [weak self] in self?.finishRecording() }
         hotkey.onCancel = { [weak self] in self?.cancelRecording() }
-        recorder.onLevel = { [weak self] in self?.panel.push(level: $0) }
+        recorder.onLevel = { [panel] in panel.push(level: $0) }
 
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        waitForAccessibility()
+        startHotkeyWhenTrusted()
         loadSpeechModel()
         if aiCleanup { loadCleanupModel() }
     }
@@ -49,34 +67,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // llama.cpp must release its GPU resources before the process exits.
         Task {
             await cleaner.unload()
-            await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
     }
 
-    private func waitForAccessibility() {
+    /// Keyboard monitoring only works once Accessibility is granted, so keep checking until it is.
+    private func startHotkeyWhenTrusted() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if AXIsProcessTrustedWithOptions(options) {
             hotkey.start()
             return
         }
-        // Keyboard monitoring only works once the permission is granted, so check again until it is.
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
             guard AXIsProcessTrusted() else { return }
             timer.invalidate()
-            self?.hotkey.start()
+            MainActor.assumeIsolated { self?.hotkey.start() }
         }
     }
 
     private func loadSpeechModel() {
         Task {
             do {
-                try await transcriber.load { [weak self] fraction in
-                    DispatchQueue.main.async { self?.speechStatus = "Downloading speech model… \(Int(fraction * 100))%" }
+                try await transcriber.load { fraction in
+                    Task { @MainActor in self.speechStatus = "Downloading speech model… \(Int(fraction * 100))%" }
                 }
-                await MainActor.run { speechStatus = "Hold right ⌘ to dictate" }
+                speechReady = true
+                speechStatus = "Hold right ⌘ to dictate"
             } catch {
-                await MainActor.run { speechStatus = "Speech model failed to load. Check your connection and relaunch." }
+                speechStatus = "Speech model failed to load. Check your connection and relaunch."
             }
         }
     }
@@ -85,12 +104,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cleanupStatus = TextCleaner.isDownloaded ? "loading…" : "downloading…"
         Task {
             do {
-                try await cleaner.load { [weak self] fraction in
-                    DispatchQueue.main.async { self?.cleanupStatus = "downloading \(Int(fraction * 100))%" }
+                try await cleaner.load { fraction in
+                    Task { @MainActor in
+                        guard self.cleanupStatus != nil else { return }
+                        self.cleanupStatus = "downloading \(Int(fraction * 100))%"
+                    }
                 }
-                await MainActor.run { cleanupStatus = nil }
+                cleanupStatus = nil
+                // Turned off while it was loading: free the memory again.
+                if !aiCleanup { await cleaner.unload() }
             } catch {
-                await MainActor.run { cleanupStatus = "failed to load" }
+                cleanupStatus = aiCleanup ? "failed to load" : nil
             }
         }
     }
@@ -99,12 +123,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startRecording() {
         guard state == .idle else { return }
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
-            NSSound.beep()
+        guard speechReady,
+              AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+              let microphone = AudioDevices.resolve(preferredUID: microphoneUID) else {
+            NSSound.beep() // the menu explains what's missing
             return
         }
         do {
-            try recorder.start()
+            try recorder.start(deviceID: microphone.id)
         } catch {
             NSSound.beep()
             return
@@ -113,8 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pressedAt = Date()
         // Show the pill only for a real hold, not a quick tap of ⌘.
         let work = DispatchWorkItem { [weak self] in
-            guard self?.state == .recording else { return }
-            self?.panel.showRecording()
+            MainActor.assumeIsolated {
+                guard let self, self.state == .recording else { return }
+                self.panel.showRecording()
+            }
         }
         showPanelWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
@@ -131,34 +159,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func finishRecording() {
         guard state == .recording else { return }
         showPanelWork?.cancel()
-        let samples = recorder.stop()
         let heldFor = Date().timeIntervalSince(pressedAt)
 
-        guard heldFor >= 0.3, samples.count >= 16_000 / 4 else {
-            panel.hide()
-            state = .idle
+        guard heldFor >= 0.3 else {
+            cancelRecording()
             return
         }
 
         state = .processing
         panel.showProcessing()
         let useCleanup = aiCleanup
+        let style = writingStyle
 
         Task {
-            var text = (try? await transcriber.transcribe(samples)) ?? ""
-            if useCleanup, !text.isEmpty, await cleaner.isReady {
-                text = await cleaner.clean(text)
-            }
-            let finalText = text
-            await MainActor.run {
-                let text = finalText
-                if !text.isEmpty {
-                    lastTranscript = text
-                    TextInserter.insert(text)
-                }
+            defer {
                 panel.hide()
                 state = .idle
             }
+            let samples = await recorder.stop(covering: heldFor)
+            guard samples.count >= 16_000 / 4 else { return }
+
+            var text: String
+            do {
+                text = try await transcriber.transcribe(samples)
+            } catch {
+                NSSound.beep()
+                return
+            }
+            if useCleanup, !text.isEmpty, await cleaner.isReady {
+                text = await cleaner.clean(text)
+            }
+            text = style.apply(text)
+            guard !text.isEmpty else { return }
+            lastTranscript = text
+            TextInserter.insert(text)
         }
     }
 
@@ -172,14 +206,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
             menu.addItem(item("Grant Microphone access…", #selector(openMicrophoneSettings)))
         } else {
-            let status = NSMenuItem(title: speechStatus, action: nil, keyEquivalent: "")
+            let noMicrophone = speechReady && AudioDevices.resolve(preferredUID: microphoneUID) == nil
+            let status = NSMenuItem(title: noMicrophone ? "No microphone available" : speechStatus,
+                                    action: nil, keyEquivalent: "")
             status.isEnabled = false
             menu.addItem(status)
         }
         menu.addItem(.separator())
 
-        let cleanupTitle = cleanupStatus.map { "AI cleanup (\($0))" } ?? "AI cleanup"
-        let cleanup = item(cleanupTitle, #selector(toggleCleanup))
+        menu.addItem(submenu("Writing style", items: WritingStyle.allCases.map { style in
+            let item = item(style.title, #selector(selectWritingStyle(_:)))
+            item.representedObject = style.rawValue
+            item.state = style == writingStyle ? .on : .off
+            return item
+        }))
+        menu.addItem(microphoneMenu())
+
+        let cleanup = item(cleanupStatus.map { "AI cleanup (\($0))" } ?? "AI cleanup", #selector(toggleCleanup))
         cleanup.state = aiCleanup ? .on : .off
         menu.addItem(cleanup)
 
@@ -191,13 +234,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let login = item("Launch at login", #selector(toggleLaunchAtLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
-        menu.addItem(item("Quit Shhh", #selector(NSApplication.terminate(_:)), key: "q"))
+        let quit = NSMenuItem(title: "Quit Shhh", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
     }
 
-    private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        item.target = action == #selector(NSApplication.terminate(_:)) ? NSApp : self
+    /// "Automatic (AirPods Pro)" followed by every connected microphone.
+    private func microphoneMenu() -> NSMenuItem {
+        let inputs = AudioDevices.inputs()
+        let lidClosed = AudioDevices.isLidClosed
+        let active = AudioDevices.resolve(preferredUID: microphoneUID)
+        let chosenIsAvailable = inputs.contains { $0.uid == microphoneUID && !($0.kind == .builtIn && lidClosed) }
+
+        let automatic = item("Automatic (\(active?.name ?? "no microphone"))", #selector(selectMicrophone(_:)))
+        automatic.state = chosenIsAvailable ? .off : .on
+
+        var items = [automatic, .separator()]
+        for input in inputs {
+            let unavailable = input.kind == .builtIn && lidClosed
+            let item = item(unavailable ? "\(input.name) (lid closed)" : input.name, #selector(selectMicrophone(_:)))
+            item.representedObject = input.uid
+            item.isEnabled = !unavailable
+            item.state = chosenIsAvailable && input.uid == microphoneUID ? .on : .off
+            items.append(item)
+        }
+        return submenu("Microphone", items: items)
+    }
+
+    private func item(_ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
         return item
+    }
+
+    private func submenu(_ title: String, items: [NSMenuItem]) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        items.forEach(menu.addItem)
+        parent.submenu = menu
+        return parent
+    }
+
+    // MARK: - Menu actions
+
+    @objc private func selectWritingStyle(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let style = WritingStyle(rawValue: raw) {
+            writingStyle = style
+        }
+    }
+
+    @objc private func selectMicrophone(_ sender: NSMenuItem) {
+        microphoneUID = sender.representedObject as? String
     }
 
     @objc private func toggleCleanup() {
