@@ -38,25 +38,43 @@ enum AudioDevices {
         }
     }
 
+    /// Everything needed to pick a microphone, read from Core Audio in one go.
+    /// Core Audio calls can block when a device misbehaves, so never take this on the main thread
+    /// without a timeout (see `AppDelegate.refreshMicrophones` and `AudioRecorder`).
+    struct Snapshot {
+        static let empty = Snapshot(inputs: [], lidClosed: false, systemDefault: 0)
+
+        let inputs: [AudioInput]
+        let lidClosed: Bool
+        let systemDefault: AudioDeviceID
+
+        func isAvailable(_ input: AudioInput) -> Bool {
+            !(input.kind == .builtIn && lidClosed)
+        }
+
+        /// The device to record from. `preferredUID` is the user's choice (nil = Automatic).
+        func pick(preferredUID: String?) -> AudioInput? {
+            if let preferredUID, let chosen = inputs.first(where: { $0.uid == preferredUID }), isAvailable(chosen) {
+                return chosen
+            }
+            let externals = inputs.filter { $0.kind == .external }
+            if let external = externals.first(where: { $0.id == systemDefault }) ?? externals.first {
+                return external
+            }
+            if lidClosed {
+                return inputs.first { $0.kind == .iPhone }
+            }
+            return inputs.first { $0.kind == .builtIn } ?? inputs.first
+        }
+    }
+
+    static func snapshot() -> Snapshot {
+        Snapshot(inputs: inputs(), lidClosed: isLidClosed, systemDefault: defaultInputID())
+    }
+
     /// The device to record from. `preferredUID` is the user's choice (nil = Automatic).
     static func resolve(preferredUID: String?) -> AudioInput? {
-        let inputs = inputs()
-        let lidClosed = isLidClosed
-
-        if let preferredUID, let chosen = inputs.first(where: { $0.uid == preferredUID }),
-           !(chosen.kind == .builtIn && lidClosed) {
-            return chosen
-        }
-
-        let externals = inputs.filter { $0.kind == .external }
-        let systemDefault = defaultInputID()
-        if let external = externals.first(where: { $0.id == systemDefault }) ?? externals.first {
-            return external
-        }
-        if lidClosed {
-            return inputs.first { $0.kind == .iPhone }
-        }
-        return inputs.first { $0.kind == .builtIn } ?? inputs.first
+        snapshot().pick(preferredUID: preferredUID)
     }
 
     /// True when a MacBook's lid is closed (clamshell mode). Its microphone is then switched off.

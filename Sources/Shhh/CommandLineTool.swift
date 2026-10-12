@@ -63,11 +63,12 @@ enum CommandLineTool {
         await cleaner.unload()
     }
 
+    @MainActor
     private static func record(seconds: Double) async throws {
-        guard let microphone = AudioDevices.resolve(preferredUID: nil) else { fail("No microphone available") }
-        print("Recording \(seconds)s from \(microphone.name)…")
         let recorder = AudioRecorder()
-        try recorder.start(deviceID: microphone.id)
+        let start = Date()
+        let microphone = try await recorder.start(preferredUID: nil)
+        print(String(format: "Recording %.0fs from %@ (started in %.2fs)…", seconds, microphone.name, Date().timeIntervalSince(start)))
         try await Task.sleep(for: .seconds(seconds))
         let samples = await recorder.stop(covering: seconds)
         let peak = samples.reduce(0) { max($0, abs($1)) }

@@ -16,6 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var state: State = .idle
     private var pressedAt = Date()
     private var showPanelWork: DispatchWorkItem?
+    private var startTask: Task<Bool, Never>?
+
+    // Last known microphones, for the menu. Read off the main thread (see refreshMicrophones).
+    private var microphones = AudioDevices.Snapshot.empty
+    private var deviceQueue = DispatchQueue(label: "shhh.devices")
+    private var deviceQueryStarted: Date?
     private var lastTranscript: String?
 
     private var speechReady = false
@@ -59,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
         startHotkeyWhenTrusted()
+        refreshMicrophones(wait: 0)
         loadSpeechModel()
         if aiCleanup { loadCleanupModel() }
     }
@@ -123,20 +130,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startRecording() {
         guard state == .idle else { return }
-        guard speechReady,
-              AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
-              let microphone = AudioDevices.resolve(preferredUID: microphoneUID) else {
+        guard speechReady, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             NSSound.beep() // the menu explains what's missing
-            return
-        }
-        do {
-            try recorder.start(deviceID: microphone.id)
-        } catch {
-            NSSound.beep()
             return
         }
         state = .recording
         pressedAt = Date()
+
+        // The microphone starts on a background queue so the app never freezes on Core Audio.
+        let preferredUID = microphoneUID
+        startTask = Task {
+            do {
+                try await recorder.start(preferredUID: preferredUID)
+                return true
+            } catch {
+                NSSound.beep() // no microphone, or the audio system didn't respond
+                if state == .recording {
+                    showPanelWork?.cancel()
+                    panel.hide()
+                    state = .idle
+                }
+                return false
+            }
+        }
         // Show the pill only for a real hold, not a quick tap of ⌘.
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -151,9 +167,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func cancelRecording() {
         guard state == .recording else { return }
         showPanelWork?.cancel()
-        _ = recorder.stop()
         panel.hide()
         state = .idle
+        let start = startTask
+        Task { if await start?.value == true { recorder.cancel() } }
     }
 
     private func finishRecording() {
@@ -170,12 +187,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.showProcessing()
         let useCleanup = aiCleanup
         let style = writingStyle
+        let start = startTask
 
         Task {
             defer {
                 panel.hide()
                 state = .idle
             }
+            guard await start?.value == true else { return }
             let samples = await recorder.stop(covering: heldFor)
             guard samples.count >= 16_000 / 4 else { return }
 
@@ -199,6 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshMicrophones(wait: 0.25)
         menu.removeAllItems()
 
         if !AXIsProcessTrusted() {
@@ -206,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
             menu.addItem(item("Grant Microphone access…", #selector(openMicrophoneSettings)))
         } else {
-            let noMicrophone = speechReady && AudioDevices.resolve(preferredUID: microphoneUID) == nil
+            let noMicrophone = speechReady && microphones.pick(preferredUID: microphoneUID) == nil
             let status = NSMenuItem(title: noMicrophone ? "No microphone available" : speechStatus,
                                     action: nil, keyEquivalent: "")
             status.isEnabled = false
@@ -241,17 +261,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// "Automatic (AirPods Pro)" followed by every connected microphone.
     private func microphoneMenu() -> NSMenuItem {
-        let inputs = AudioDevices.inputs()
-        let lidClosed = AudioDevices.isLidClosed
-        let active = AudioDevices.resolve(preferredUID: microphoneUID)
-        let chosenIsAvailable = inputs.contains { $0.uid == microphoneUID && !($0.kind == .builtIn && lidClosed) }
+        let inputs = microphones.inputs
+        let active = microphones.pick(preferredUID: microphoneUID)
+        let chosenIsAvailable = inputs.contains { $0.uid == microphoneUID && microphones.isAvailable($0) }
 
         let automatic = item("Automatic (\(active?.name ?? "no microphone"))", #selector(selectMicrophone(_:)))
         automatic.state = chosenIsAvailable ? .off : .on
 
         var items = [automatic, .separator()]
         for input in inputs {
-            let unavailable = input.kind == .builtIn && lidClosed
+            let unavailable = !microphones.isAvailable(input)
             let item = item(unavailable ? "\(input.name) (lid closed)" : input.name, #selector(selectMicrophone(_:)))
             item.representedObject = input.uid
             item.isEnabled = !unavailable
@@ -259,6 +278,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             items.append(item)
         }
         return submenu("Microphone", items: items)
+    }
+
+    /// Reads the microphone list on a background queue and waits at most `wait` for it, so a
+    /// misbehaving audio device can never freeze the menu. Falls back to the last known list.
+    private func refreshMicrophones(wait: TimeInterval) {
+        if let started = deviceQueryStarted {
+            guard Date().timeIntervalSince(started) > 5 else { return } // a read is already running
+            deviceQueue = DispatchQueue(label: "shhh.devices") // that one is stuck: start over
+        }
+        deviceQueryStarted = Date()
+        let result = SnapshotBox()
+        let done = DispatchSemaphore(value: 0)
+        deviceQueue.async {
+            result.set(AudioDevices.snapshot())
+            done.signal()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    if let snapshot = result.get() { self.microphones = snapshot }
+                    self.deviceQueryStarted = nil
+                }
+            }
+        }
+        if done.wait(timeout: .now() + wait) == .success, let snapshot = result.get() {
+            microphones = snapshot
+        }
     }
 
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {
@@ -323,4 +367,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openMicrophoneSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
     }
+}
+
+/// Hands a snapshot from the device queue to the main thread.
+private final class SnapshotBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AudioDevices.Snapshot?
+
+    func set(_ snapshot: AudioDevices.Snapshot) { lock.lock(); value = snapshot; lock.unlock() }
+    func get() -> AudioDevices.Snapshot? { lock.lock(); defer { lock.unlock() }; return value }
 }
