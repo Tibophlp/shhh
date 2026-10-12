@@ -70,6 +70,10 @@ The speech model (~600 MB) downloads once on first launch. A waveform icon then 
 
 ## Usage
 
+<p align="center">
+  <img src="docs/one-key.jpg" alt="The whole app is one key: hold right command, speak, let go" width="520">
+</p>
+
 | Do this | What happens |
 | --- | --- |
 | Hold **right ⌘** and talk | Recording. The pill appears at the bottom of the screen. |
@@ -88,13 +92,11 @@ The menu-bar icon has these options:
 
 ## Writing style
 
-| Style | Example |
-| --- | --- |
-| **Very formal** | I do not think it is ready, we are going to need more tests. |
-| **Casual** (default) | I don't think it's ready, we're gonna need more tests. |
-| **Very casual** | i don't think it's ready, we're gonna need more tests |
+<p align="center">
+  <img src="docs/writing-styles.jpg" alt="One sentence in the three writing styles: very formal, casual and very casual" width="520">
+</p>
 
-Very formal expands contractions and slang ("gonna" becomes "going to") and always ends with punctuation. Very casual is all lowercase (acronyms like API stay) with no final period. Casual leaves your words as spoken.
+Casual is the default. Very formal expands contractions and slang ("gonna" becomes "going to") and always ends with punctuation. Very casual is all lowercase (acronyms like API stay) with no final period. Casual leaves your words as spoken.
 
 ## Microphone
 
@@ -122,6 +124,10 @@ Off by default. Turn it on from the menu bar. It downloads a small local model (
 
 ## How it works
 
+<p align="center">
+  <img src="docs/how-it-works.jpg" alt="How Shhh works: hold right command, speech to text on your Mac, optional cleanup, typed at your cursor" width="520">
+</p>
+
 ```
 right ⌘ held ─▶ microphone ─▶ Parakeet speech model ─▶ [AI cleanup] ─▶ writing style ─▶ paste at cursor
 ```
@@ -132,7 +138,7 @@ right ⌘ held ─▶ microphone ─▶ Parakeet speech model ─▶ [AI cleanup
 | Cleanup | [Qwen3 1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) via [llama.cpp](https://github.com/ggml-org/llama.cpp), prompted as a copy-editor, with a delete-only safety check |
 | Microphone | Core Audio device list, lid state read from IOKit (`AppleClamshellState`) |
 | Typing | Clipboard + ⌘V into the focused app, then your previous clipboard is restored |
-| App | Native Swift, about 1,400 lines, no dependencies beyond the two above |
+| App | Native Swift, about 1,500 lines, no dependencies beyond the two above |
 
 <details>
 <summary><b>Project layout</b></summary>
@@ -148,6 +154,7 @@ Sources/Shhh/
   TextCleaner.swift      optional AI cleanup
   TextInserter.swift     paste + clipboard restore
   RecordingPanel.swift   the pill
+  Watchdog.swift         time limit for audio-system calls
   CommandLineTool.swift  terminal test modes (below)
 scripts/
   build.sh               build Shhh.app (--install: install and launch, --release: zip for GitHub)
@@ -179,7 +186,7 @@ Make sure Shhh is enabled in **System Settings → Privacy & Security → Access
 <details>
 <summary><b>Shhh beeps when I hold right ⌘</b></summary>
 
-Something is missing, and the menu-bar menu says what: the speech model is still downloading, Microphone access isn't granted, or no microphone is available (for example the lid is closed with no iPhone or headphones around).
+Something is missing, and the menu-bar menu says what: the speech model is still downloading, Microphone access isn't granted, or no microphone is available (for example the lid is closed with no iPhone or headphones around). It also beeps if macOS's audio system doesn't respond within a couple of seconds, which can happen while a device like an iPhone microphone is connecting or dropping out. Shhh stays usable and simply tries again on your next press.
 </details>
 
 <details>
