@@ -8,29 +8,39 @@ final class RecordingPanel {
     private lazy var panel: NSPanel = makePanel()
     /// Bumped on every show so a fade-out that finishes late can't hide a newer pill.
     private var generation = 0
+    /// Whether the pill is up (or fading in). False as soon as a fade-out starts.
+    private var isShown = false
 
     func showRecording() {
-        generation += 1
         model.mode = .recording
         model.levels = Array(repeating: 0, count: PillModel.barCount)
-        position()
-        panel.alphaValue = 0
-        panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.12; panel.animator().alphaValue = 1 }
+        present()
     }
 
     func showProcessing() {
         model.mode = .processing
+        present() // normally already up; covers a recording pill that missed its cue
     }
 
     func hide() {
-        guard panel.isVisible else { return }
+        guard isShown else { return }
+        isShown = false
         let hiding = generation
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; panel.animator().alphaValue = 0 }) {
             MainActor.assumeIsolated {
                 if self.generation == hiding { self.panel.orderOut(nil) }
             }
         }
+    }
+
+    private func present() {
+        guard !isShown else { return }
+        isShown = true
+        generation += 1
+        position()
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.12; panel.animator().alphaValue = 1 }
     }
 
     /// Feed microphone loudness (0...1). Called from the audio thread.
@@ -63,7 +73,9 @@ final class RecordingPanel {
     /// Bottom-centre of the screen the mouse is on.
     private func position() {
         let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        // NSMouseInRect, not contains: the mouse can sit on a screen's top edge (the menu bar),
+        // which contains() leaves out, and the pill would land on another display.
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let frame = screen?.visibleFrame else { return }
         let size = panel.frame.size
         panel.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2, y: frame.minY + 18))

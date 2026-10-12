@@ -13,7 +13,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let panel = RecordingPanel()
 
     private var statusItem: NSStatusItem!
-    private var state: State = .idle
+    private var state: State = .idle {
+        didSet { stayAwake(state != .idle) }
+    }
+    private var activity: NSObjectProtocol?
     private var pressedAt = Date()
     private var showPanelWork: DispatchWorkItem?
     private var startTask: Task<Bool, Never>?
@@ -162,6 +165,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         showPanelWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    /// Shhh sits idle with no windows, so macOS puts it in App Nap and lets its timers run late.
+    /// The pill waits on a 0.15 s timer: delayed past the release, only the text would show up.
+    /// Opting out while dictating keeps timers and the pill's fade on time.
+    private func stayAwake(_ awake: Bool) {
+        if awake, activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+                                                             reason: "Dictating")
+        } else if !awake, let activity {
+            ProcessInfo.processInfo.endActivity(activity)
+            self.activity = nil
+        }
     }
 
     private func cancelRecording() {
