@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon.HIToolbox
 import ServiceManagement
 
 /// Owns the menu-bar item and runs the dictation flow:
@@ -8,7 +9,7 @@ import ServiceManagement
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let hotkey = HotkeyMonitor()
     private let recorder = AudioRecorder()
-    private let transcriber = Transcriber()
+    private var transcriber = Transcriber()
     private let cleaner = TextCleaner()
     private let panel = RecordingPanel()
 
@@ -19,7 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var activity: NSObjectProtocol?
     private var pressedAt = Date()
     private var showPanelWork: DispatchWorkItem?
-    private var startTask: Task<Bool, Never>?
+    private var startTask: Task<AudioRecorder.Recording?, Never>?
+    /// Bumped on every press, so a late result from an earlier dictation can't touch this one.
+    private var dictation = 0
 
     // Last known microphones, for the menu. Read off the main thread (see refreshMicrophones).
     private var microphones = AudioDevices.Snapshot.empty
@@ -28,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastTranscript: String?
 
     private var speechReady = false
+    private var speechLoading = false
     private var speechStatus = "Loading speech model…"
     private var cleanupStatus: String?
 
@@ -67,47 +71,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recorder.onLevel = { [panel] in panel.push(level: $0) }
 
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        startHotkeyWhenTrusted()
+        watchAccessibility()
         refreshMicrophones(wait: 0)
         loadSpeechModel()
         if aiCleanup { loadCleanupModel() }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // llama.cpp must release its GPU resources before the process exits.
+        // llama.cpp must release its GPU resources before the process exits. If the model is
+        // stuck mid-cleanup, quit anyway rather than hang.
         Task {
-            await cleaner.unload()
+            _ = try? await withTimeout(2) { [cleaner] in await cleaner.unload() }
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
     }
 
-    /// Keyboard monitoring only works once Accessibility is granted, so keep checking until it is.
-    private func startHotkeyWhenTrusted() {
+    /// Keyboard monitoring only works with the Accessibility permission. Keep checking: monitors
+    /// stop receiving keys when it's withdrawn (or reset by macOS) and must be set up again once
+    /// it's back, otherwise the key stays dead until a relaunch.
+    private func watchAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        if AXIsProcessTrustedWithOptions(options) {
-            hotkey.start()
-            return
+        _ = AXIsProcessTrustedWithOptions(options) // asks once, at launch
+        syncHotkey()
+        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.syncHotkey() }
         }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
-            guard AXIsProcessTrusted() else { return }
-            timer.invalidate()
-            MainActor.assumeIsolated { self?.hotkey.start() }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func syncHotkey() {
+        if AXIsProcessTrusted() {
+            hotkey.start()
+        } else if hotkey.isRunning {
+            hotkey.stop()
         }
     }
 
+    /// Loads the speech model, retrying every 30 s if that fails (e.g. offline at login).
     private func loadSpeechModel() {
+        guard !speechReady, !speechLoading else { return }
+        speechLoading = true
+        let transcriber = self.transcriber
         Task {
             do {
                 try await transcriber.load { fraction in
                     Task { @MainActor in self.speechStatus = "Downloading speech model… \(Int(fraction * 100))%" }
                 }
+                guard transcriber === self.transcriber else { return } // replaced meanwhile
+                speechLoading = false
                 speechReady = true
                 speechStatus = "Hold right ⌘ to dictate"
             } catch {
-                speechStatus = "Speech model failed to load. Check your connection and relaunch."
+                guard transcriber === self.transcriber else { return }
+                speechLoading = false
+                speechStatus = "Speech model failed to load. Retrying…"
+                try? await Task.sleep(for: .seconds(30))
+                loadSpeechModel()
             }
         }
+    }
+
+    /// A transcription that never finished leaves the model stuck: start over with a fresh one.
+    private func reloadSpeechModel() {
+        transcriber = Transcriber()
+        speechReady = false
+        speechLoading = false
+        speechStatus = "Loading speech model…"
+        loadSpeechModel()
     }
 
     private func loadCleanupModel() {
@@ -134,26 +166,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startRecording() {
         guard state == .idle else { return }
         guard speechReady, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            loadSpeechModel() // retry now if an earlier load failed
             NSSound.beep() // the menu explains what's missing
             return
         }
         state = .recording
         pressedAt = Date()
+        dictation += 1
+        let current = dictation
 
         // The microphone starts on a background queue so the app never freezes on Core Audio.
         let preferredUID = microphoneUID
         startTask = Task {
             do {
-                try await recorder.start(preferredUID: preferredUID)
-                return true
+                return try await recorder.start(preferredUID: preferredUID)
             } catch {
                 NSSound.beep() // no microphone, or the audio system didn't respond
-                if state == .recording {
+                if state == .recording, dictation == current {
                     showPanelWork?.cancel()
                     panel.hide()
                     state = .idle
                 }
-                return false
+                return nil
             }
         }
         // Show the pill only for a real hold, not a quick tap of ⌘.
@@ -186,7 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.hide()
         state = .idle
         let start = startTask
-        Task { if await start?.value == true { recorder.cancel() } }
+        Task { if let recording = await start?.value { recorder.cancel(recording) } }
     }
 
     private func finishRecording() {
@@ -204,25 +238,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let useCleanup = aiCleanup
         let style = writingStyle
         let start = startTask
+        let transcriber = self.transcriber
 
         Task {
             defer {
                 panel.hide()
                 state = .idle
             }
-            guard await start?.value == true else { return }
-            let samples = await recorder.stop(covering: heldFor)
-            guard samples.count >= 16_000 / 4 else { return }
+            guard let recording = await start?.value else { return } // already beeped
+            let samples = await recorder.stop(recording, covering: heldFor)
+            guard samples.count >= 16_000 / 4 else {
+                NSSound.beep() // the microphone sent no audio
+                return
+            }
 
             var text: String
             do {
-                text = try await transcriber.transcribe(samples)
+                // Normally well under a second. Far longer means the model is stuck.
+                let seconds = Double(samples.count) / 16_000
+                text = try await withTimeout(15 + seconds) { try await transcriber.transcribe(samples) }
             } catch {
                 NSSound.beep()
+                if error is WatchdogError, transcriber === self.transcriber { reloadSpeechModel() }
                 return
             }
-            if useCleanup, !text.isEmpty, await cleaner.isReady {
-                text = await cleaner.clean(text)
+            if useCleanup, !text.isEmpty {
+                let raw = text
+                let deadline = Date().addingTimeInterval(5)
+                text = (try? await withTimeout(6) { [cleaner] in
+                    await cleaner.isReady ? await cleaner.clean(raw, deadline: deadline) : raw
+                }) ?? TextCleaner.removeFillers(raw)
             }
             text = style.apply(text)
             guard !text.isEmpty else { return }
@@ -243,8 +288,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("Grant Microphone access…", #selector(openMicrophoneSettings)))
         } else {
             let noMicrophone = speechReady && microphones.pick(preferredUID: microphoneUID) == nil
-            let status = NSMenuItem(title: noMicrophone ? "No microphone available" : speechStatus,
-                                    action: nil, keyEquivalent: "")
+            let title = if let blocker = Self.secureInputApp() {
+                "\(blocker) is blocking the keyboard"
+            } else if noMicrophone {
+                "No microphone available"
+            } else {
+                speechStatus
+            }
+            let status = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             status.isEnabled = false
             menu.addItem(status)
         }
@@ -319,6 +370,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if done.wait(timeout: .now() + wait) == .success, let snapshot = result.get() {
             microphones = snapshot
         }
+    }
+
+    /// While an app has Secure Input on (a password field, some terminals and password managers),
+    /// macOS hides keys from other apps and right ⌘ does nothing. Returns that app's name.
+    private static func secureInputApp() -> String? {
+        guard IsSecureEventInputEnabled() else { return nil }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        let pid = (session?["kCGSSessionSecureInputPID"] as? NSNumber)?.int32Value
+        return pid.flatMap { NSRunningApplication(processIdentifier: $0)?.localizedName } ?? "Another app"
     }
 
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {

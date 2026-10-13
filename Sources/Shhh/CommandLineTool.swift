@@ -67,10 +67,10 @@ enum CommandLineTool {
     private static func record(seconds: Double) async throws {
         let recorder = AudioRecorder()
         let start = Date()
-        let microphone = try await recorder.start(preferredUID: nil)
-        print(String(format: "Recording %.0fs from %@ (started in %.2fs)…", seconds, microphone.name, Date().timeIntervalSince(start)))
+        let recording = try await recorder.start(preferredUID: nil)
+        print(String(format: "Recording %.0fs from %@ (started in %.2fs)…", seconds, recording.input.name, Date().timeIntervalSince(start)))
         try await Task.sleep(for: .seconds(seconds))
-        let samples = await recorder.stop(covering: seconds)
+        let samples = await recorder.stop(recording, covering: seconds)
         let peak = samples.reduce(0) { max($0, abs($1)) }
         print(String(format: "Captured %.1fs, peak level %.2f", Double(samples.count) / 16_000, peak))
         let transcriber = Transcriber()

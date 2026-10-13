@@ -115,8 +115,9 @@ actor TextCleaner {
         sampler = nil; context = nil; model = nil; vocab = nil
     }
 
-    /// Returns the cleaned text, or the input with only filler words removed if anything looks off.
-    func clean(_ text: String) async -> String {
+    /// Returns the cleaned text, or the input with only filler words removed if anything looks off
+    /// or the model is still writing at `deadline`.
+    func clean(_ text: String, deadline: Date = .distantFuture) async -> String {
         let basic = Self.removeFillers(text)
         guard let context, let vocab, let sampler else { return basic }
         let wordCount = basic.split(separator: " ").count
@@ -132,6 +133,7 @@ actor TextCleaner {
         var bytes: [CChar] = []
         let maxTokens = suffix.count * 2 + 16
         for _ in 0..<maxTokens {
+            guard Date() < deadline else { return basic }
             var token = llama_sampler_sample(sampler, context, -1)
             if llama_vocab_is_eog(vocab, token) { break }
             var buffer = [CChar](repeating: 0, count: 64)

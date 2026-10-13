@@ -20,9 +20,30 @@ func runWithWatchdog<T>(on queue: DispatchQueue, timeout: TimeInterval,
     }
 }
 
+/// Awaits `operation` for at most `timeout`, then throws `WatchdogError.timedOut`.
+///
+/// For async work that can stall for good (a model stuck on the Neural Engine or the GPU).
+/// On a timeout the operation is left running and its result is dropped.
+func withTimeout<T>(_ timeout: TimeInterval, _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withCheckedThrowingContinuation { continuation in
+        let gate = OnceGate()
+        Task {
+            do {
+                let value = try await operation()
+                if gate.claim() { continuation.resume(returning: value) }
+            } catch {
+                if gate.claim() { continuation.resume(throwing: error) }
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+            if gate.claim() { continuation.resume(throwing: WatchdogError.timedOut) }
+        }
+    }
+}
+
 enum WatchdogError: LocalizedError {
     case timedOut
-    var errorDescription: String? { "The audio system didn't respond in time" }
+    var errorDescription: String? { "Didn't respond in time" }
 }
 
 /// Lets exactly one of several racing callers through.
