@@ -180,13 +180,13 @@ $BIN/Shhh --record 3               # record 3 s from it and transcribe
 <details>
 <summary><b>Nothing happens when I hold right ⌘</b></summary>
 
-Make sure Shhh is enabled in **System Settings → Privacy & Security → Accessibility**. If you rebuilt or updated the app, toggle it off and on again. Password fields and some secure apps block keyboard monitoring on purpose.
+Make sure Shhh is enabled in **System Settings → Privacy & Security → Accessibility**. If you rebuilt or updated the app, toggle it off and on again; Shhh picks the key back up within a few seconds. Password fields and some apps (password managers, terminals with Secure Keyboard Entry) block keyboard monitoring on purpose: while one does, the menu-bar menu names it.
 </details>
 
 <details>
 <summary><b>Shhh beeps when I hold right ⌘</b></summary>
 
-Something is missing, and the menu-bar menu says what: the speech model is still downloading, Microphone access isn't granted, or no microphone is available (for example the lid is closed with no iPhone or headphones around). It also beeps if macOS's audio system doesn't respond within a couple of seconds, which can happen while a device like an iPhone microphone is connecting or dropping out. Shhh stays usable and simply tries again on your next press.
+Something is missing, and the menu-bar menu says what: the speech model is still downloading, Microphone access isn't granted, or no microphone is available (for example the lid is closed with no iPhone or headphones around). It also beeps if macOS's audio system doesn't respond within a couple of seconds, which can happen while a device like an iPhone microphone is connecting or dropping out. It also beeps after you let go if the microphone sent no audio. Shhh stays usable and simply tries again on your next press.
 </details>
 
 <details>

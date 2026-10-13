@@ -28,7 +28,9 @@ final class RecordingPanel {
         let hiding = generation
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; panel.animator().alphaValue = 0 }) {
             MainActor.assumeIsolated {
-                if self.generation == hiding { self.panel.orderOut(nil) }
+                guard self.generation == hiding else { return }
+                self.panel.orderOut(nil)
+                self.model.mode = .idle // the processing dots would keep animating off screen
             }
         }
     }
@@ -83,9 +85,9 @@ final class RecordingPanel {
 }
 
 final class PillModel: ObservableObject {
-    enum Mode { case recording, processing }
+    enum Mode { case idle, recording, processing }
     static let barCount = 11
-    @Published var mode: Mode = .recording
+    @Published var mode: Mode = .idle
     @Published var levels: [CGFloat] = Array(repeating: 0, count: barCount)
 }
 
@@ -106,7 +108,7 @@ private struct PillView: View {
                     }
                 }
                 .animation(.easeOut(duration: 0.08), value: model.levels)
-            } else {
+            } else if model.mode == .processing {
                 ProcessingDots()
             }
         }
