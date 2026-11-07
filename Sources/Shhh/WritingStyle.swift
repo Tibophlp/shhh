@@ -24,13 +24,16 @@ enum WritingStyle: String, CaseIterable {
         case .casual:
             return text
         case .veryFormal:
+            // Judged on the spoken words: "don't touch that" would read as a question once it says "do not".
+            let isQuestion = Self.looksLikeQuestion(text)
             var result = Self.isEnglish(text) ? Self.expandContractions(text) : text
             if let first = result.first, first.isLowercase { result = first.uppercased() + result.dropFirst() }
-            if let last = result.last, last.isLetter || last.isNumber { result += Self.looksLikeQuestion(result) ? "?" : "." }
+            if let last = result.last, last.isLetter || last.isNumber { result += isQuestion ? "?" : "." }
             return result
         case .veryCasual:
             var result = Self.lowercasedKeepingAcronyms(text)
-            while result.hasSuffix(".") { result.removeLast() }
+            // One final period only: "wait..." keeps its ellipsis.
+            if result.hasSuffix("."), !result.hasSuffix("..") { result.removeLast() }
             return result
         }
     }
@@ -45,8 +48,13 @@ enum WritingStyle: String, CaseIterable {
     /// Only used when the sentence has no punctuation at all.
     private static func looksLikeQuestion(_ text: String) -> Bool {
         let lastSentence = text.components(separatedBy: CharacterSet(charactersIn: ".!?")).last ?? text
-        let first = lastSentence.split(separator: " ").first.map { $0.lowercased() } ?? ""
-        return questionStarts.contains(first)
+        let words = lastSentence.split(separator: " ").prefix(2)
+            .map { $0.lowercased().replacingOccurrences(of: "’", with: "'") }
+        guard let first = words.first else { return false }
+        // "isn't it great", "don't you think", but not "don't touch that".
+        let negativeQuestion = first.hasSuffix("n't") && words.count == 2
+            && ["i", "you", "he", "she", "it", "we", "they"].contains(words[1])
+        return questionStarts.contains(first) || negativeQuestion
     }
 
     private static let slang: [String: String] = [
@@ -70,7 +78,11 @@ enum WritingStyle: String, CaseIterable {
             let parts = original.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
             let word = String(parts.first ?? "")
             let next = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : nil
-            if let expanded = expand(word, next: next?.lowercased()) {
+            // "isn't it", "don't you": expanding gives "is not it", so keep the contraction.
+            let beforePronoun = word.lowercased().replacingOccurrences(of: "’", with: "'").hasSuffix("n't")
+                && ns.substring(from: NSMaxRange(match.range))
+                    .range(of: #"^\s+(i|you|he|she|it|we|they)\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+            if !beforePronoun, let expanded = expand(word, next: next?.lowercased()) {
                 result += matchCase(expanded, to: word) + (next.map { " " + $0 } ?? "")
             } else {
                 result += original

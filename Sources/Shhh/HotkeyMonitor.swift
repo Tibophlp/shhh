@@ -87,7 +87,9 @@ final class HotkeyMonitor {
         releaseCheck?.invalidate()
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                if !NSEvent.modifierFlags.contains(.command) { self?.release() }
+                // Right ⌘ itself, not any ⌘: a held left ⌘ would hide a missed release.
+                let held = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(Self.rightCommandKeyCode))
+                if !held { self?.release() }
             }
         }
         RunLoop.main.add(timer, forMode: .common)

@@ -104,7 +104,7 @@ actor TextCleaner {
 
         // Evaluate the instructions + examples once; every dictation reuses this cache.
         let prefix = tokenize(Self.fewShot, addSpecial: true)
-        guard decode(prefix) else { throw CleanerError.loadFailed }
+        guard decode(prefix) else { unload(); throw CleanerError.loadFailed } // else isReady would lie
         prefixCount = Int32(prefix.count)
     }
 
@@ -156,8 +156,15 @@ actor TextCleaner {
     /// Deterministic, and also runs before the model.
     static func removeFillers(_ text: String) -> String {
         var result = text
-        let sounds = #"(?i),?\s*\b(u+m+|u+h+|uhm|e+r+m+|euh+|heu+|hm+|hum+)\b[,.]?"#
+        let filler = "(?:u+m+|u+h+|uhm|e+r+m+|euh+|heu+|hm+|hum+)"
+        let sounds = #"(?i),?\s*\b"# + filler + #"\b[,.]?"#
         let phrases = #"(?i),\s*(like|you know|genre|tu vois)\s*,"#
+        if NLLanguageRecognizer.dominantLanguage(for: text) == .french {
+            // "que, euh, on" must become "qu'on", not "que on", once the filler is gone.
+            // shortcut: also elides before an aspirated h ("le, euh, héros" → "l'héros"), add a word list if that shows up.
+            let elision = #"(?i)\b(qu|j|d|n|l|s|m|t|c)e\s*,?\s*"# + filler + #"\b[,.]?\s+(?=[aeiouyhàâéèêëîïôû])"#
+            result = result.replacingOccurrences(of: elision, with: "$1'", options: .regularExpression)
+        }
         result = result.replacingOccurrences(of: sounds, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: phrases, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
@@ -170,7 +177,7 @@ actor TextCleaner {
     }
 
     private static let correctionCues = [
-        "actually", "i mean", "no wait", "sorry", "scratch that", "rather", "instead",
+        "actually", "actually no", "i mean", "no wait", "sorry", "scratch that", "rather", "instead",
         "enfin", "plutôt", "non", "pardon", "je veux dire", "en fait",
     ]
 
@@ -180,33 +187,44 @@ actor TextCleaner {
     ]
 
     /// The model may only delete words, never add or change them. Deleting real words is only
-    /// allowed when the speaker corrected themselves; otherwise only fillers and repeats may go.
-    private static func isSafe(input: String, output: String) -> Bool {
+    /// allowed when the speaker corrected themselves, and only what came before their last cue:
+    /// "Sorry for the late reply, I was away" is not a correction, nothing before "sorry" was taken back.
+    static func isSafe(input: String, output: String) -> Bool {
         let inWords = words(input)
         let outWords = words(output)
         guard !outWords.isEmpty, Double(outWords.count) >= Double(inWords.count) * 0.35 else { return false }
 
-        // Output must be the input with some words removed (same order).
+        // Output must be the input with some words removed (same order). Aligned from the end so a
+        // repeated word ("to John, sorry, to Jane") counts as deleted before the cue, not after it.
         var deleted: [(word: String, index: Int)] = []
-        var i = 0
-        for word in outWords {
-            while i < inWords.count, inWords[i] != word {
+        var i = inWords.count - 1
+        for word in outWords.reversed() {
+            while i >= 0, inWords[i] != word {
                 deleted.append((inWords[i], i))
-                i += 1
+                i -= 1
             }
-            guard i < inWords.count else { return false }
-            i += 1
+            guard i >= 0 else { return false }
+            i -= 1
         }
-        while i < inWords.count { deleted.append((inWords[i], i)); i += 1 }
+        while i >= 0 { deleted.append((inWords[i], i)); i -= 1 }
 
-        let lowered = input.lowercased()
-        let speakerCorrected = correctionCues.contains { lowered.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }
-        if !speakerCorrected {
-            for (word, index) in deleted {
-                let isRepeat = (index > 0 && inWords[index - 1] == word) || (index + 1 < inWords.count && inWords[index + 1] == word)
-                if !fillerWords.contains(word) && !isRepeat { return false }
+        // Where the last correction cue sits.
+        var cueStart = -1, cueEnd = 0
+        for cue in correctionCues {
+            let cueWords = cue.split(separator: " ").map(String.init)
+            for start in stride(from: inWords.count - cueWords.count, through: 0, by: -1)
+            where Array(inWords[start..<start + cueWords.count]) == cueWords {
+                if start + cueWords.count > cueEnd { cueStart = start; cueEnd = start + cueWords.count }
+                break
             }
         }
+
+        let content = deleted.filter { word, index in
+            let isRepeat = (index > 0 && inWords[index - 1] == word) || (index + 1 < inWords.count && inWords[index + 1] == word)
+            return !fillerWords.contains(word) && !isRepeat
+        }
+        let corrected = content.contains { $0.index < cueStart }
+        if content.contains(where: { !corrected || $0.index >= cueEnd }) { return false }
 
         let inLang = NLLanguageRecognizer.dominantLanguage(for: input)
         let outLang = NLLanguageRecognizer.dominantLanguage(for: output)

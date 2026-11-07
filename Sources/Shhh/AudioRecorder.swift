@@ -12,6 +12,7 @@ final class AudioRecorder {
     var onLevel: (@Sendable (Float) -> Void)?
 
     private var queue = AudioRecorder.makeQueue()
+    private var abandonedQueues = 0
 
     /// One recording, returned by `start` and handed back to `stop` or `cancel`.
     final class Recording {
@@ -37,8 +38,12 @@ final class AudioRecorder {
             return Recording(input: input, session: session, queue: queue)
         } catch WatchdogError.timedOut {
             // That queue is stuck inside Core Audio. Abandon it; if the call ever returns,
-            // the queued stop cleans up the engine it started.
-            self.queue = Self.makeQueue()
+            // the queued stop cleans up the engine it started. Past 3 stuck threads, keep
+            // waiting on this one instead of leaking more while Core Audio stays hung.
+            if abandonedQueues < 3 {
+                abandonedQueues += 1
+                self.queue = Self.makeQueue()
+            }
             queue.async { session.stop() }
             throw WatchdogError.timedOut
         }

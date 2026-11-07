@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var microphones = AudioDevices.Snapshot.empty
     private var deviceQueue = DispatchQueue(label: "shhh.devices")
     private var deviceQueryStarted: Date?
+    private var abandonedDeviceQueues = 0
     private var lastTranscript: String?
 
     private var speechReady = false
@@ -36,6 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cleanupStatus: String?
 
     private enum State { case idle, recording, processing }
+    /// About 19 MB of audio.
+    private static let maxRecording: TimeInterval = 5 * 60
 
     // MARK: - Settings
 
@@ -117,7 +120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             do {
                 try await transcriber.load { fraction in
-                    Task { @MainActor in self.speechStatus = "Downloading speech model… \(Int(fraction * 100))%" }
+                    Task { @MainActor in
+                        guard !self.speechReady else { return } // a late update would hide "Hold right ⌘"
+                        self.speechStatus = "Downloading speech model… \(Int(fraction * 100))%"
+                    }
                 }
                 guard transcriber === self.transcriber else { return } // replaced meanwhile
                 speechLoading = false
@@ -156,7 +162,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Turned off while it was loading: free the memory again.
                 if !aiCleanup { await cleaner.unload() }
             } catch {
-                cleanupStatus = aiCleanup ? "failed to load" : nil
+                guard aiCleanup else { cleanupStatus = nil; return }
+                // Like the speech model: e.g. offline at login, so try again rather than stay off.
+                // shortcut: a model file that can never load is retried every 30 s forever, delete it on loadFailed if that shows up.
+                cleanupStatus = "failed to load, retrying…"
+                try? await Task.sleep(for: .seconds(30))
+                if aiCleanup, cleanupStatus == "failed to load, retrying…" { loadCleanupModel() }
             }
         }
     }
@@ -188,6 +199,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     state = .idle
                 }
                 return nil
+            }
+        }
+        // A forgotten hold (or a release macOS never reports) would record forever, growing the
+        // audio in memory. Stop and transcribe at the cap; the later real release is then ignored.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxRecording) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.state == .recording, self.dictation == current else { return }
+                self.finishRecording()
             }
         }
         // Show the pill only for a real hold, not a quick tap of ⌘.
@@ -272,7 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             text = style.apply(text)
             guard !text.isEmpty else { return }
             lastTranscript = text
-            TextInserter.insert(text)
+            await TextInserter.insert(text)
         }
     }
 
@@ -352,9 +371,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshMicrophones(wait: TimeInterval) {
         if let started = deviceQueryStarted {
             guard Date().timeIntervalSince(started) > 5 else { return } // a read is already running
-            deviceQueue = DispatchQueue(label: "shhh.devices") // that one is stuck: start over
+            // That one is stuck: start over, but stop leaking threads if Core Audio stays hung.
+            guard abandonedDeviceQueues < 3 else { return }
+            abandonedDeviceQueues += 1
+            deviceQueue = DispatchQueue(label: "shhh.devices")
         }
-        deviceQueryStarted = Date()
+        let started = Date()
+        deviceQueryStarted = started
         let result = SnapshotBox()
         let done = DispatchSemaphore(value: 0)
         deviceQueue.async {
@@ -362,6 +385,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             done.signal()
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
+                    // A stuck read that finally returns must not overwrite (or unlock) a newer one.
+                    guard self.deviceQueryStarted == started else { return }
                     if let snapshot = result.get() { self.microphones = snapshot }
                     self.deviceQueryStarted = nil
                 }

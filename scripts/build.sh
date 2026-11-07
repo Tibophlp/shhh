@@ -12,6 +12,7 @@ SIGN_ID="Shhh Local Signing"
 
 swift build -c release --arch arm64
 BIN=$(swift build -c release --arch arm64 --show-bin-path)
+"$BIN/Shhh" --selftest # cleanup safety rules, styles, ⌘V key: never ship a build that breaks them
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
